@@ -5,10 +5,15 @@ const { Server } = require('socket.io');
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-  pingInterval: 25000,
   pingTimeout: 60000,
-  maxHttpBufferSize: 1e8, // 100MB
+  pingInterval: 25000,
+  maxHttpBufferSize: 1e8,
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST'],
+  },
 });
+
 
 let localClient = null;
 let nextId = 1;
