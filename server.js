@@ -3,7 +3,11 @@ const http = require('http');
 const WebSocket = require('ws');
 const app = express();
 const server = http.createServer(app);
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocket.Server({
+  server,
+  maxPayload: 1024 * 1024 * 1000 // 1000 MB nếu cần
+});
+
 
 let localSocket = null;
 
