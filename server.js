@@ -66,9 +66,19 @@ app.all('*', async (req, res) => {
     if (!result) return res.status(504).send('No response from local');
 
     res.status(result.status);
-    for (const [key, value] of Object.entries(result.headers)) {
-      res.setHeader(key, value);
-    }
+   for (const [key, value] of Object.entries(result.headers)) {
+    if (key.toLowerCase() === 'set-cookie') {
+      // Nếu là mảng cookie
+      if (Array.isArray(value)) {
+        value.forEach(v => res.append('Set-Cookie', v));
+      } else {
+        res.setHeader('Set-Cookie', value);
+      }
+    } else {
+    res.setHeader(key, value);
+  }
+}
+
     res.send(Buffer.from(result.body, 'base64'));
   });
 });
