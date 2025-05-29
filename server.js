@@ -5,21 +5,23 @@ const { Server } = require('socket.io');
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-  maxHttpBufferSize: 1e8, // 100 MB
-  cors: {
-    origin: '*',
-    methods: ['GET', 'POST']
-  }
+  pingInterval: 25000,
+  pingTimeout: 60000,
+  maxHttpBufferSize: 1e8 // 100MB
 });
 
-let localSocket = null;
-const pendingRequests = new Map();
+let localClient = null;
 let nextId = 1;
+const pendingRequests = new Map();
 
-// Kết nối từ client local
 io.on('connection', (socket) => {
   console.log('✅ Local client connected via Socket.IO');
-  localSocket = socket;
+  localClient = socket;
+
+  socket.on('disconnect', (reason) => {
+    console.log('⚠️ Local client disconnected:', reason);
+    localClient = null;
+  });
 
   socket.on('http-response', (data) => {
     const { requestId, status, headers, body } = data;
@@ -29,62 +31,76 @@ io.on('connection', (socket) => {
       pendingRequests.delete(requestId);
     }
   });
-
-  socket.on('disconnect', (reason) => {
-    console.log('⚠️ Local client disconnected:', reason);
-    localSocket = null;
-  });
-
-  socket.on('error', (err) => {
-    console.error('❌ Socket error:', err);
-  });
 });
 
-// Proxy tất cả request HTTP tới client local
-app.all('*', express.raw({ type: '*/*' }), async (req, res) => {
-  if (!localSocket) return res.status(503).send('Local client not connected');
+// CORS middleware
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT, PATCH, DELETE');
+  res.setHeader('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+  next();
+});
 
-  const requestId = (nextId++).toString();
-  const body = req.body.toString('base64');
-
-  const payload = {
-    requestId,
-    method: req.method,
-    path: req.originalUrl,
-    headers: req.headers,
-    body
-  };
-
-  const result = await new Promise((resolve, reject) => {
-    pendingRequests.set(requestId, { resolve, reject });
-    localSocket.emit('http-request', payload);
-    setTimeout(() => {
-      if (pendingRequests.has(requestId)) {
-        pendingRequests.delete(requestId);
-        reject(new Error('Timeout'));
-      }
-    }, 10000);
-  }).catch(() => null);
-
-  if (!result) return res.status(504).send('No response from local');
-
-  res.status(result.status);
-  for (const [key, value] of Object.entries(result.headers)) {
-    if (key.toLowerCase() === 'set-cookie') {
-      if (Array.isArray(value)) {
-        value.forEach(v => res.append('Set-Cookie', v));
-      } else {
-        res.setHeader('Set-Cookie', value);
-      }
-    } else {
-      res.setHeader(key, value);
-    }
+// Main proxy logic
+app.all('*', (req, res) => {
+  if (!localClient || localClient.disconnected) {
+    return res.status(503).send('⚠️ No local client connected');
   }
 
-  res.send(Buffer.from(result.body, 'base64'));
+  const chunks = [];
+  req.on('data', chunk => chunks.push(chunk));
+  req.on('end', async () => {
+    const rawBody = Buffer.concat(chunks);
+    const body = rawBody.length > 0 ? rawBody.toString('base64') : '';
+
+    // Clean up unnecessary headers
+    const cleanHeaders = { ...req.headers };
+    const remove = [
+      'cf-ray', 'cf-visitor', 'cdn-loop', 'true-client-ip', 'x-forwarded-for',
+      'x-forwarded-proto', 'x-request-start', 'render-proxy-ttl', 'rndr-id'
+    ];
+    remove.forEach(h => delete cleanHeaders[h]);
+
+    const requestId = (nextId++).toString();
+
+    const payload = {
+      requestId,
+      method: req.method,
+      path: req.originalUrl,
+      headers: cleanHeaders,
+      body
+    };
+
+    const result = await new Promise((resolve, reject) => {
+      pendingRequests.set(requestId, { resolve, reject });
+      localClient.emit('http-request', payload);
+      setTimeout(() => {
+        if (pendingRequests.has(requestId)) {
+          pendingRequests.delete(requestId);
+          reject(new Error('Timeout'));
+        }
+      }, 5000);
+    }).catch(() => null);
+
+    if (!result) return res.status(504).send('⏱ No response from local client');
+
+    res.status(result.status);
+    for (const [key, value] of Object.entries(result.headers || {})) {
+      if (key.toLowerCase() === 'set-cookie') {
+        if (Array.isArray(value)) value.forEach(v => res.append('Set-Cookie', v));
+        else res.setHeader('Set-Cookie', value);
+      } else {
+        res.setHeader(key, value);
+      }
+    }
+
+    const decodedBody = result.body ? Buffer.from(result.body, 'base64') : Buffer.alloc(0);
+    res.send(decodedBody);
+  });
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 server.listen(PORT, () => {
   console.log(`🚀 Socket.IO Proxy Server running on port ${PORT}`);
+  console.log(`     ==> Your service is live 🎉`);
 });
