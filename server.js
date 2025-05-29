@@ -1,102 +1,90 @@
 const express = require('express');
 const http = require('http');
-const WebSocket = require('ws');
+const { Server } = require('socket.io');
 
 const app = express();
 const server = http.createServer(app);
-
-const wss = new WebSocket.Server({
-  server,
-  maxPayload: 1024 * 1024 * 1000, // 1000 MB
-  clientTracking: true // Đảm bảo giữ danh sách client
+const io = new Server(server, {
+  maxHttpBufferSize: 1e8, // 100 MB
+  cors: {
+    origin: '*',
+    methods: ['GET', 'POST']
+  }
 });
 
 let localSocket = null;
 const pendingRequests = new Map();
 let nextId = 1;
 
-wss.on('connection', (ws) => {
-  console.log('✅ Local client connected');
-  localSocket = ws;
+// Kết nối từ client local
+io.on('connection', (socket) => {
+  console.log('✅ Local client connected via Socket.IO');
+  localSocket = socket;
 
-  ws.on('message', (data) => {
-    try {
-      const { requestId, status, headers, body } = JSON.parse(data);
-      const pending = pendingRequests.get(requestId);
-      if (pending) {
-        pending.resolve({ status, headers, body });
-        pendingRequests.delete(requestId);
-      }
-    } catch (e) {
-      console.error('❌ Invalid message from client:', e);
+  socket.on('http-response', (data) => {
+    const { requestId, status, headers, body } = data;
+    const pending = pendingRequests.get(requestId);
+    if (pending) {
+      pending.resolve({ status, headers, body });
+      pendingRequests.delete(requestId);
     }
   });
 
-  ws.on('ping', () => {
-    // Optional log
-    console.log('📡 Received ping from client');
-  });
-
-  ws.on('close', (code, reason) => {
-    console.log(`⚠️ Local client disconnected (code: ${code}, reason: ${reason})`);
+  socket.on('disconnect', (reason) => {
+    console.log('⚠️ Local client disconnected:', reason);
     localSocket = null;
   });
 
-  ws.on('error', (err) => {
-    console.error('❌ WebSocket error:', err.message);
+  socket.on('error', (err) => {
+    console.error('❌ Socket error:', err);
   });
 });
 
-app.all('*', async (req, res) => {
-  if (!localSocket || localSocket.readyState !== WebSocket.OPEN) {
-    return res.status(503).send('Local server not connected');
+// Proxy tất cả request HTTP tới client local
+app.all('*', express.raw({ type: '*/*' }), async (req, res) => {
+  if (!localSocket) return res.status(503).send('Local client not connected');
+
+  const requestId = (nextId++).toString();
+  const body = req.body.toString('base64');
+
+  const payload = {
+    requestId,
+    method: req.method,
+    path: req.originalUrl,
+    headers: req.headers,
+    body
+  };
+
+  const result = await new Promise((resolve, reject) => {
+    pendingRequests.set(requestId, { resolve, reject });
+    localSocket.emit('http-request', payload);
+    setTimeout(() => {
+      if (pendingRequests.has(requestId)) {
+        pendingRequests.delete(requestId);
+        reject(new Error('Timeout'));
+      }
+    }, 10000);
+  }).catch(() => null);
+
+  if (!result) return res.status(504).send('No response from local');
+
+  res.status(result.status);
+  for (const [key, value] of Object.entries(result.headers)) {
+    if (key.toLowerCase() === 'set-cookie') {
+      if (Array.isArray(value)) {
+        value.forEach(v => res.append('Set-Cookie', v));
+      } else {
+        res.setHeader('Set-Cookie', value);
+      }
+    } else {
+      res.setHeader(key, value);
+    }
   }
 
-  const chunks = [];
-  req.on('data', (chunk) => chunks.push(chunk));
-  req.on('end', async () => {
-    const body = Buffer.concat(chunks).toString('base64');
-    const requestId = (nextId++).toString();
-
-    const payload = {
-      requestId,
-      method: req.method,
-      path: req.originalUrl,
-      headers: req.headers,
-      body
-    };
-
-    const result = await new Promise((resolve, reject) => {
-      pendingRequests.set(requestId, { resolve, reject });
-      localSocket.send(JSON.stringify(payload));
-      setTimeout(() => {
-        if (pendingRequests.has(requestId)) {
-          pendingRequests.delete(requestId);
-          reject(new Error('Timeout'));
-        }
-      }, 10000); // timeout tăng lên nếu response lớn
-    }).catch(() => null);
-
-    if (!result) return res.status(504).send('No response from local client');
-
-    res.status(result.status);
-    for (const [key, value] of Object.entries(result.headers)) {
-      if (key.toLowerCase() === 'set-cookie') {
-        if (Array.isArray(value)) {
-          value.forEach(v => res.append('Set-Cookie', v));
-        } else {
-          res.setHeader('Set-Cookie', value);
-        }
-      } else {
-        res.setHeader(key, value);
-      }
-    }
-
-    res.send(Buffer.from(result.body, 'base64'));
-  });
+  res.send(Buffer.from(result.body, 'base64'));
 });
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`🚀 Proxy server listening at http://localhost:${PORT}`);
+  console.log(`🚀 Socket.IO Proxy Server running on port ${PORT}`);
 });
