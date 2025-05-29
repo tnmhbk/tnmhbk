@@ -7,19 +7,20 @@ const server = http.createServer(app);
 const io = new Server(server, {
   pingInterval: 25000,
   pingTimeout: 60000,
-  maxHttpBufferSize: 1e8 // 100MB
+  maxHttpBufferSize: 1e8, // 100MB
 });
 
 let localClient = null;
 let nextId = 1;
 const pendingRequests = new Map();
 
+// --- Socket.IO logic ---
 io.on('connection', (socket) => {
   console.log('✅ Local client connected via Socket.IO');
   localClient = socket;
 
   socket.on('disconnect', (reason) => {
-    console.log('⚠️ Local client disconnected:', reason);
+    console.warn('⚠️ Client disconnected:', reason);
     localClient = null;
   });
 
@@ -33,7 +34,7 @@ io.on('connection', (socket) => {
   });
 });
 
-// CORS middleware
+// --- CORS ---
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS, PUT, PATCH, DELETE');
@@ -41,7 +42,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Main proxy logic
+// --- Proxy logic ---
 app.all('*', (req, res) => {
   if (!localClient || localClient.disconnected) {
     return res.status(503).send('⚠️ No local client connected');
@@ -53,13 +54,11 @@ app.all('*', (req, res) => {
     const rawBody = Buffer.concat(chunks);
     const body = rawBody.length > 0 ? rawBody.toString('base64') : '';
 
-    // Clean up unnecessary headers
     const cleanHeaders = { ...req.headers };
-    const remove = [
+    [
       'cf-ray', 'cf-visitor', 'cdn-loop', 'true-client-ip', 'x-forwarded-for',
       'x-forwarded-proto', 'x-request-start', 'render-proxy-ttl', 'rndr-id'
-    ];
-    remove.forEach(h => delete cleanHeaders[h]);
+    ].forEach(h => delete cleanHeaders[h]);
 
     const requestId = (nextId++).toString();
 
@@ -68,7 +67,7 @@ app.all('*', (req, res) => {
       method: req.method,
       path: req.originalUrl,
       headers: cleanHeaders,
-      body
+      body,
     };
 
     const result = await new Promise((resolve, reject) => {
@@ -79,7 +78,7 @@ app.all('*', (req, res) => {
           pendingRequests.delete(requestId);
           reject(new Error('Timeout'));
         }
-      }, 5000);
+      }, 8000);
     }).catch(() => null);
 
     if (!result) return res.status(504).send('⏱ No response from local client');
